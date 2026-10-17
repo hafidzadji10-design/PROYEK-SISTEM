@@ -1,130 +1,259 @@
-let socket;
-let reconnectTimer;
-let manualFan = false;
-let manualLed = false;
+"use strict";
 
-const $ = id => document.getElementById(id);
+/*
+ * Jika halaman dan ESP32 berada di jaringan yang sama:
+ *   ESP32_URL = "http://192.168.1.50"
+ *
+ * Ganti alamat IP di bawah dengan alamat ESP32 Anda.
+ * Endpoint yang digunakan:
+ *   GET  http://IP-ESP32/api/status
+ *   POST http://IP-ESP32/api/control
+ */
+const ESP32_URL = "http://192.168.1.50";
+const POLL_INTERVAL_MS = 2000;
 
-function connectToEsp32() {
-  // Buka dashboard menggunakan alamat ESP32, misalnya http://192.168.1.50
-  const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const wsUrl = `${wsProtocol}//${location.host}/ws`;
+const elements = {
+  connectionDot: document.getElementById("connectionDot"),
+  connectionStatus: document.getElementById("connectionStatus"),
+  temperature: document.getElementById("temperature"),
+  humidity: document.getElementById("humidity"),
+  rfidCount: document.getElementById("rfidCount"),
+  touchCount: document.getElementById("touchCount"),
+  fanToggle: document.getElementById("fanToggle"),
+  fanStatus: document.getElementById("fanStatus"),
+  ledToggle: document.getElementById("ledToggle"),
+  ledStatus: document.getElementById("ledStatus"),
+  motionStatus: document.getElementById("motionStatus"),
+  motionIndicator: document.getElementById("motionIndicator"),
+  chartTempValue: document.getElementById("chartTempValue"),
+  chartHumidityValue: document.getElementById("chartHumidityValue"),
+  historyBody: document.getElementById("historyBody"),
+  lastUpdated: document.getElementById("lastUpdated"),
+  clearHistory: document.getElementById("clearHistory")
+};
 
-  socket = new WebSocket(wsUrl);
+let isConnected = false;
+let requestInProgress = false;
 
-  socket.addEventListener("open", () => {
-    $("connectionStatus").textContent = "Terhubung ke ESP32";
-    $("connectionDot").className = "dot connected";
-    clearTimeout(reconnectTimer);
-  });
+function setConnection(connected, message) {
+  isConnected = connected;
+  elements.connectionStatus.textContent = message;
+  elements.connectionDot.classList.toggle("connected", connected);
+  elements.connectionDot.classList.toggle("disconnected", !connected);
 
-  socket.addEventListener("message", event => {
-    try {
-      handleEsp32Data(JSON.parse(event.data));
-    } catch (error) {
-      console.error("Data ESP32 tidak valid:", error);
-    }
-  });
-
-  socket.addEventListener("close", () => {
-    $("connectionStatus").textContent = "Terputus — mencoba menyambung...";
-    $("connectionDot").className = "dot disconnected";
-    reconnectTimer = setTimeout(connectToEsp32, 2000);
-  });
-
-  socket.addEventListener("error", () => socket.close());
+  // Jangan izinkan kontrol sebelum ESP32 berhasil dihubungi.
+  elements.fanToggle.disabled = !connected;
+  elements.ledToggle.disabled = !connected;
 }
 
-function handleEsp32Data(data) {
-  if (data.temperature !== undefined) {
-    $("temperature").textContent = `${Number(data.temperature).toFixed(1)}°C`;
-    $("chartTempValue").textContent = `${Number(data.temperature).toFixed(1)}°C`;
-  }
-
-  if (data.humidity !== undefined) {
-    $("humidity").textContent = `${Math.round(data.humidity)}%`;
-    $("chartHumidityValue").textContent = `${Math.round(data.humidity)}%`;
-  }
-
-  if (data.rfidCount !== undefined) {
-    $("rfidCount").textContent = data.rfidCount;
-  }
-
-  if (data.touchCount !== undefined) {
-    $("touchCount").textContent = data.touchCount;
-  }
-
-  if (data.fan !== undefined) {
-    $("fanStatus").textContent = data.fan ? "MENYALA" : "MATI";
-    if (!manualFan) $("fanToggle").checked = Boolean(data.fan);
-  }
-
-  if (data.led !== undefined) {
-    $("ledStatus").textContent = data.led ? "Menyala" : "Mati";
-    if (!manualLed) $("ledToggle").checked = Boolean(data.led);
-  }
-
-  if (data.motion !== undefined) {
-    $("motionStatus").textContent = data.motion ? "Gerakan terdeteksi" : "Tidak ada gerakan";
-  }
-
-  if (data.event) addHistory(data.event);
+function formatTemperature(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number.toFixed(1)}°C` : "--.-°C";
 }
 
-function sendCommand(command, value) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    $("connectionStatus").textContent = "ESP32 belum terhubung";
+function formatHumidity(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${Math.round(number)}%` : "--%";
+}
+
+function setSwitchState(input, value) {
+  if (typeof value === "boolean") {
+    input.checked = value;
+  } else if (value === 1 || value === "ON" || value === "on") {
+    input.checked = true;
+  } else if (value === 0 || value === "OFF" || value === "off") {
+    input.checked = false;
+  }
+}
+
+function renderHistory(history) {
+  if (!Array.isArray(history) || history.length === 0) {
+    elements.historyBody.innerHTML = `
+      <tr><td colspan="4" class="empty-row">Belum ada riwayat aktivitas.</td></tr>
+    `;
     return;
   }
 
-  socket.send(JSON.stringify({ command, value }));
+  // Batasi jumlah baris agar tabel tetap ringan.
+  const rows = history.slice(-30).reverse();
+
+  elements.historyBody.innerHTML = rows.map((item) => {
+    const time = escapeHtml(item.time ?? item.timestamp ?? "--");
+    const sensor = escapeHtml(item.sensor ?? item.type ?? "Sensor");
+    const activity = escapeHtml(item.activity ?? item.message ?? "--");
+    const status = escapeHtml(item.status ?? "Berhasil");
+
+    return `
+      <tr>
+        <td>${time}</td>
+        <td>${sensor}</td>
+        <td>${activity}</td>
+        <td><span class="status-tag">${status}</span></td>
+      </tr>
+    `;
+  }).join("");
 }
 
-function addHistory(event) {
-  const body = $("historyBody");
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (character) => {
+    const replacements = {
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#039;"
+    };
+    return replacements[character];
+  });
+}
 
-  if (body.querySelector(".empty-row")) body.innerHTML = "";
+function updateDashboard(data) {
+  if (!data || typeof data !== "object") {
+    throw new Error("Format data status tidak valid.");
+  }
 
-  const row = document.createElement("tr");
-  const values = [
-    new Date().toLocaleTimeString("id-ID"),
-    event.sensor || "ESP32",
-    event.activity || "Aktivitas terdeteksi",
-    event.status || "Berhasil"
-  ];
+  if (data.temperature !== undefined) {
+    elements.temperature.innerHTML =
+      `${Number(data.temperature).toFixed(1)}<small>°C</small>`;
+    elements.chartTempValue.textContent = formatTemperature(data.temperature);
+  }
 
-  values.forEach((value, index) => {
-    const cell = document.createElement("td");
+  if (data.humidity !== undefined) {
+    elements.humidity.innerHTML =
+      `${Math.round(Number(data.humidity))}<small>%</small>`;
+    elements.chartHumidityValue.textContent = formatHumidity(data.humidity);
+  }
 
-    if (index === 3) {
-      const badge = document.createElement("span");
-      badge.className = "badge";
-      badge.textContent = value;
-      cell.appendChild(badge);
-    } else {
-      cell.textContent = value;
+  if (data.rfidCount !== undefined) {
+    elements.rfidCount.textContent = String(data.rfidCount);
+  }
+
+  if (data.touchCount !== undefined) {
+    elements.touchCount.textContent = String(data.touchCount);
+  }
+
+  if (data.fan !== undefined) {
+    setSwitchState(elements.fanToggle, data.fan);
+  }
+
+  elements.fanStatus.textContent = elements.fanToggle.checked
+    ? "MENYALA"
+    : "MATI";
+
+  if (data.led !== undefined) {
+    setSwitchState(elements.ledToggle, data.led);
+  }
+
+  elements.ledStatus.textContent = elements.ledToggle.checked
+    ? "MENYALA"
+    : "MATI";
+
+  if (data.motion !== undefined) {
+    const motionDetected =
+      data.motion === true ||
+      data.motion === 1 ||
+      data.motion === "1" ||
+      data.motion === "detected";
+
+    elements.motionStatus.textContent = motionDetected
+      ? "Gerakan terdeteksi"
+      : "Tidak ada gerakan";
+
+    elements.motionIndicator.classList.toggle("active", motionDetected);
+  }
+
+  if (Array.isArray(data.history)) {
+    renderHistory(data.history);
+  }
+
+  elements.lastUpdated.textContent =
+    `Diperbarui ${new Date().toLocaleTimeString("id-ID")}`;
+}
+
+async function fetchStatus() {
+  if (requestInProgress) return;
+  requestInProgress = true;
+
+  try {
+    const response = await fetch(`${ESP32_URL}/api/status`, {
+      method: "GET",
+      cache: "no-store",
+      signal: AbortSignal.timeout(5000)
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
     }
 
-    row.appendChild(cell);
-  });
-
-  body.prepend(row);
-  while (body.rows.length > 20) body.deleteRow(body.rows.length - 1);
+    const data = await response.json();
+    updateDashboard(data);
+    setConnection(true, "Terhubung ke ESP32");
+  } catch (error) {
+    setConnection(false, "ESP32 tidak terhubung");
+    console.error("Gagal mengambil status ESP32:", error);
+  } finally {
+    requestInProgress = false;
+  }
 }
 
-$("fanToggle").addEventListener("change", event => {
-  manualFan = true;
-  sendCommand("fan", event.target.checked);
+async function sendControl(device, enabled) {
+  if (!isConnected) {
+    alert("ESP32 belum terhubung.");
+    return false;
+  }
+
+  try {
+    const response = await fetch(`${ESP32_URL}/api/control`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ [device]: enabled }),
+      signal: AbortSignal.timeout(5000)
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    // Ambil status terbaru setelah perintah dikirim.
+    await fetchStatus();
+    return true;
+  } catch (error) {
+    console.error(`Gagal mengubah ${device}:`, error);
+    setConnection(false, "Gagal mengirim kontrol");
+    return false;
+  }
+}
+
+elements.fanToggle.addEventListener("change", async (event) => {
+  const requestedState = event.target.checked;
+  const success = await sendControl("fan", requestedState);
+
+  if (!success) {
+    event.target.checked = !requestedState;
+    elements.fanStatus.textContent = event.target.checked ? "MENYALA" : "MATI";
+  }
 });
 
-$("ledToggle").addEventListener("change", event => {
-  manualLed = true;
-  sendCommand("led", event.target.checked);
+elements.ledToggle.addEventListener("change", async (event) => {
+  const requestedState = event.target.checked;
+  const success = await sendControl("led", requestedState);
+
+  if (!success) {
+    event.target.checked = !requestedState;
+    elements.ledStatus.textContent = event.target.checked ? "MENYALA" : "MATI";
+  }
 });
 
-$("clearHistory").addEventListener("click", () => {
-  $("historyBody").innerHTML =
-    '<tr><td colspan="4" class="empty-row">Riwayat tampilan dihapus.</td></tr>';
+elements.clearHistory.addEventListener("click", () => {
+  elements.historyBody.innerHTML = `
+    <tr><td colspan="4" class="empty-row">
+      Tampilan riwayat dikosongkan. Data di ESP32 tidak dihapus.
+    </td></tr>
+  `;
 });
 
-connectToEsp32();
+// Ambil data saat halaman dibuka, lalu perbarui berkala.
+fetchStatus();
+setInterval(fetchStatus, POLL_INTERVAL_MS);
